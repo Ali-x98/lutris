@@ -29,31 +29,19 @@ from lutris.util.wine.dxvk import update_shader_cache
 class GameActions:
     """Regroup a list of callbacks for a game"""
 
-    def __init__(self, application=None, window=None):
+    def __init__(self, game, window, application=None):
         self.application = application or Gio.Application.get_default()
-        self.window = window
-        self.game_id = None
-        self._game = None
-
-    @property
-    def game(self):
-        if not self._game:
-            self._game = self.application.get_game_by_id(self.game_id)
-            if not self._game:
-                self._game = Game(self.game_id)
-        return self._game
+        self.window = window  # also used as a LaunchUIDelegate
+        self.game = game
 
     @property
     def is_game_running(self):
-        return bool(self.application.get_game_by_id(self.game_id))
+        return self.game and self.game.is_db_stored and bool(self.application.get_game_by_id(self.game.id))
 
-    def set_game(self, game=None, game_id=None):
-        if game:
-            self._game = game
-            self.game_id = game.id
-        else:
-            self._game = None
-            self.game_id = game_id
+    def on_game_state_changed(self, game):
+        """Handler called when the game has changed state"""
+        if self.game and game.id == self.game.get_safe_id():
+            self.game = game
 
     def get_game_actions(self):
         """Return a list of game actions and their callbacks"""
@@ -113,7 +101,7 @@ class GameActions:
         """Return a dictionary of actions that should be shown for a game"""
         return {
             "add": not self.game.is_installed,
-            "duplicate": True,
+            "duplicate": self.game.is_installed,
             "install": not self.game.is_installed,
             "play": self.game.is_installed and not self.is_game_running,
             "update": self.game.is_updatable,
@@ -123,7 +111,7 @@ class GameActions:
             "configure": bool(self.game.is_installed),
             "browse": self.game.is_installed and self.game.runner_name != "browser",
             "show_logs": self.game.is_installed,
-            "favorite": not self.game.is_favorite,
+            "favorite": not self.game.is_favorite and self.game.is_installed,
             "deletefavorite": self.game.is_favorite,
             "install_more": not self.game.service and self.game.is_installed,
             "execute-script": bool(
@@ -158,7 +146,7 @@ class GameActions:
                 and steam_shortcut.shortcut_exists(self.game)
                 and not steam_shortcut.is_steam_game(self.game)
             ),
-            "remove": True,
+            "remove": self.game.is_installed or self.game.is_db_stored,
             "view": True,
             "hide": self.game.is_installed and not self.game.is_hidden,
             "unhide": self.game.is_hidden,
@@ -169,11 +157,14 @@ class GameActions:
         self.game.launch(self.window)
 
     def get_running_game(self):
-        ids = self.application.get_running_game_ids()
-        for game_id in ids:
-            if str(game_id) == str(self.game.id):
-                return self.game
-        logger.warning("Game %s not in %s", self.game_id, ids)
+        if self.game and self.game.is_db_stored:
+            ids = self.application.get_running_game_ids()
+            for game_id in ids:
+                if str(game_id) == str(self.game.id):
+                    return self.game
+            logger.warning("Game %s not in %s", self.game.id, ids)
+
+        return None
 
     def on_game_stop(self, _caller):
         """Stops the game"""
@@ -196,7 +187,7 @@ class GameActions:
         """Install a game"""
         # Install the currently selected game in the UI
         if not self.game.slug:
-            raise RuntimeError("No game to install: %s" % self.game.id)
+            raise RuntimeError("No game to install: %s" % self.game.get_safe_id())
         self.game.emit("game-install")
 
     def on_update_clicked(self, _widget):
@@ -341,7 +332,7 @@ class GameActions:
 
     def on_view_game(self, _widget):
         """Callback to open a game on lutris.net"""
-        open_uri("https://lutris.net/games/%s" % self.game.slug)
+        open_uri("https://lutris.net/games/%s" % self.game.slug.replace("_", "-"))
 
     def on_remove_game(self, *_args):
         """Callback that present the uninstall dialog to the user"""

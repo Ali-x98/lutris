@@ -1,6 +1,6 @@
 """Module that actually runs the games."""
 
-# pylint: disable=too-many-public-methods
+# pylint: disable=too-many-public-methods disable=too-many-lines
 import json
 import os
 import shlex
@@ -107,7 +107,7 @@ class Game(GObject.Object):
 
     def __init__(self, game_id=None):
         super().__init__()
-        self.id = game_id  # pylint: disable=invalid-name
+        self._id = game_id  # pylint: disable=invalid-name
         self.runner = None
         self.config = None
 
@@ -156,6 +156,23 @@ class Game(GObject.Object):
         # Adding Discord App ID for RPC
         self.discord_id = game_data.get('discord_id')
 
+    @staticmethod
+    def create_empty_service_game(db_game, service):
+        """Creates a Game from the database data from ServiceGameCollection, which is
+        not a real game, but which can be used to install. Such a game has no ID, but
+        has an 'appid' and slug."""
+        game = Game()
+        game.name = db_game["name"]
+        game.slug = db_game["slug"]
+
+        if "service_id" in db_game:
+            game.appid = db_game["service_id"]
+        elif service:
+            game.appid = db_game["appid"]
+
+        game.service = service.id if service else None
+        return game
+
     def __repr__(self):
         return self.__str__()
 
@@ -174,9 +191,25 @@ class Game(GObject.Object):
         return False
 
     @property
+    def id(self):
+        if self._id is None:
+            logger.error("The game '%s' has no ID, it is not stored in the PGA.", self.name)
+        return self._id
+
+    def get_safe_id(self):
+        """Returns the ID, or None if this Game has not got one; use this
+        rather than 'id' if your code expects to cope with the None."""
+        return self._id
+
+    @property
+    def is_db_stored(self):
+        """True if this Game has an ID, which means it is saved in the PGA."""
+        return self._id is not None
+
+    @property
     def is_updatable(self):
         """Return whether the game can be upgraded"""
-        return self.service in ["gog", "itchio"]
+        return self.is_installed and self.service in ["gog", "itchio"]
 
     @property
     def is_favorite(self):
@@ -185,7 +218,7 @@ class Game(GObject.Object):
 
     def get_categories(self):
         """Return the categories the game is in."""
-        return categories_db.get_categories_in_game(self.id)
+        return categories_db.get_categories_in_game(self.id) if self.is_db_stored else []
 
     def add_to_favorites(self):
         """Add the game to the 'favorite' category"""
@@ -223,17 +256,17 @@ class Game(GObject.Object):
 
     @property
     def formatted_playtime(self):
-        """Return a human readable formatted play time"""
+        """Return a human-readable formatted play time"""
         return strings.get_formatted_playtime(self.playtime)
 
     def signal_error(self, error):
-        """Reports an error by firing game-error. If its handled returns
-        True to indicate it handled it, that's it. If not, this fires
+        """Reports an error by firing game-error. If handled, it returns
+        True to indicate it handled it, and that's it. If not, this fires
         game-unhandled-error, which is actually handled via an emission hook
         and should not be connected otherwise.
 
-        This allows special error handling to be set up for a partical Game, but
-        there's always something."""
+        This allows special error handling to be set up for a particular Game, but
+        there's always some handling."""
         handled = self.emit("game-error", error)
         if not handled:
             self.emit("game-unhandled-error", error)
@@ -333,9 +366,9 @@ class Game(GObject.Object):
         if self.is_installed:
             raise RuntimeError(_("Uninstall the game before deleting"))
         games_db.delete_game(self.id)
-        if no_signal:
-            return
-        self.emit("game-removed")
+        if not no_signal:
+            self.emit("game-removed")
+        self._id = None
 
     def set_platform_from_runner(self):
         """Set the game's platform from the runner"""
@@ -379,7 +412,7 @@ class Game(GObject.Object):
             "has_custom_icon": "icon" in self.custom_images,
             "has_custom_coverart_big": "coverart_big" in self.custom_images
         }
-        self.id = games_db.add_or_update(**game_data)
+        self._id = games_db.add_or_update(**game_data)
         self.emit("game-updated")
 
     def save_platform(self):
@@ -401,7 +434,7 @@ class Game(GObject.Object):
 
     def check_launchable(self):
         """Verify that the current game can be launched, and raises exceptions if not."""
-        if not self.is_installed:
+        if not self.is_installed or not self.is_db_stored:
             logger.error("%s (%s) not installed", self, self.id)
             raise GameConfigError(_("Tried to launch a game that isn't installed."))
         if not self.runner:
@@ -512,6 +545,9 @@ class Game(GObject.Object):
         gameplay_info = self.runner.play()
         if "error" in gameplay_info:
             raise self.get_config_error(gameplay_info)
+
+        if "working_dir" not in gameplay_info:
+            gameplay_info["working_dir"] = self.runner.working_dir
 
         config = launch_ui_delegate.select_game_launch_config(self)
 
@@ -751,7 +787,10 @@ class Game(GObject.Object):
             self.force_stop()
             return False
         game_pids = self.get_game_pids()
-        if not self.game_thread.is_running and not game_pids:
+        runs_only_prelaunch = False
+        if self.prelaunch_executor and self.prelaunch_executor.is_running:
+            runs_only_prelaunch = game_pids == {self.prelaunch_executor.game_process.pid}
+        if runs_only_prelaunch or (not self.game_thread.is_running and not game_pids):
             logger.debug("Game thread stopped")
             self.on_game_quit()
             return False

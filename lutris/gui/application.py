@@ -309,7 +309,7 @@ class Application(Gtk.Application):
         if kwargs.get("installers"):
             return kwargs["installers"][0]["game_slug"]
         if kwargs.get("game"):
-            return str(kwargs["game"].id)
+            return str(kwargs["game"].get_safe_id())
         return str(kwargs)
 
     def show_window(self, window_class, **kwargs):
@@ -676,12 +676,15 @@ class Application(Gtk.Application):
         """Callback to remove the game from the running games"""
         ids = self.get_running_game_ids()
         if str(game.id) in ids:
+            logger.debug("Removing %s from running IDs", game.id)
             try:
                 self.running_games.remove(ids.index(str(game.id)))
             except ValueError:
                 pass
-        else:
+        elif ids:
             logger.warning("%s not in %s", game.id, ids)
+        else:
+            logger.debug("Game has already been removed from running IDs?")
 
         game.emit("game-stopped")
         if settings.read_setting("hide_client_on_game_start") == "True" and not self.quit_on_game_exit:

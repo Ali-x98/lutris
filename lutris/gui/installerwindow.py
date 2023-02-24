@@ -3,12 +3,12 @@
 import os
 from gettext import gettext as _
 
-from gi.repository import GLib, Gtk
+from gi.repository import Gio, GLib, Gtk
 
 from lutris.config import LutrisConfig
 from lutris.exceptions import UnavailableGameError, watch_errors
 from lutris.game import Game
-from lutris.gui.dialogs import DirectoryDialog, ErrorDialog, InstallerSourceDialog, QuestionDialog
+from lutris.gui.dialogs import DirectoryDialog, ErrorDialog, InstallerSourceDialog, ModelessDialog, QuestionDialog
 from lutris.gui.dialogs.cache import CacheConfigurationDialog
 from lutris.gui.dialogs.delegates import DialogInstallUIDelegate
 from lutris.gui.installer.files_box import InstallerFilesBox
@@ -16,7 +16,6 @@ from lutris.gui.installer.script_picker import InstallerPicker
 from lutris.gui.widgets.common import FileChooserEntry
 from lutris.gui.widgets.log_text_view import LogTextView
 from lutris.gui.widgets.navigation_stack import NavigationStack
-from lutris.gui.widgets.window import BaseApplicationWindow
 from lutris.installer import InstallationKind, get_installers, interpreter
 from lutris.installer.errors import MissingGameDependency, ScriptingError
 from lutris.installer.interpreter import ScriptInterpreter
@@ -27,7 +26,7 @@ from lutris.util.strings import gtk_safe, human_size
 from lutris.util.system import is_removeable
 
 
-class InstallerWindow(BaseApplicationWindow,
+class InstallerWindow(ModelessDialog,
                       DialogInstallUIDelegate,
                       ScriptInterpreter.InterpreterUIDelegate):  # pylint: disable=too-many-public-methods
     """GUI for the install process.
@@ -48,10 +47,10 @@ class InstallerWindow(BaseApplicationWindow,
         installers,
         service=None,
         appid=None,
-        application=None,
-        installation_kind=InstallationKind.INSTALL
+        installation_kind=InstallationKind.INSTALL,
+        **kwargs
     ):
-        BaseApplicationWindow.__init__(self, application=application)
+        ModelessDialog.__init__(self, use_header_bar=True, **kwargs)
         ScriptInterpreter.InterpreterUIDelegate.__init__(self, service, appid)
         self.set_default_size(740, 460)
         self.installers = installers
@@ -65,29 +64,32 @@ class InstallerWindow(BaseApplicationWindow,
         self.accelerators = Gtk.AccelGroup()
         self.add_accel_group(self.accelerators)
 
+        content_area = self.get_content_area()
+
+        content_area.set_margin_top(18)
+        content_area.set_margin_bottom(18)
+        content_area.set_margin_right(18)
+        content_area.set_margin_left(18)
+        content_area.set_spacing(12)
+
         # Header labels
 
-        self.title_label = InstallerWindow.MarkupLabel(selectable=False)
-        self.title_label.set_markup(_("<b>Install %s</b>") % gtk_safe(self.installers[0]["name"]))
-        self.vbox.pack_start(self.title_label, False, False, 0)
+        self.status_label = InstallerWindow.MarkupLabel(no_show_all=True)
+        content_area.pack_start(self.status_label, False, False, 0)
 
-        self.status_label = InstallerWindow.MarkupLabel()
-        self.vbox.pack_start(self.status_label, False, False, 0)
+        # Header bar buttons
 
-        # Action buttons
-
-        self.back_button = self.add_start_button(_("Back"), self.on_back_clicked, sensitive=False)
+        self.back_button = self.add_start_button(_("Back"), self.on_back_clicked)
+        self.back_button.set_no_show_all(True)
         key, mod = Gtk.accelerator_parse("<Alt>Left")
         self.back_button.add_accelerator("clicked", self.accelerators, key, mod, Gtk.AccelFlags.VISIBLE)
         key, mod = Gtk.accelerator_parse("<Alt>Home")
         self.accelerators.connect(key, mod, Gtk.AccelFlags.VISIBLE, self.on_navigate_home)
-        self.cache_button = self.add_start_button(_("Cache"), self.on_cache_clicked,
-                                                  tooltip=_("Change where Lutris downloads game installer files."))
+
+        self.cancel_button = self.add_start_button(_("Cancel"), self.on_cancel_clicked)
+        self.get_header_bar().set_show_close_button(False)
 
         self.continue_button = self.add_end_button(_("_Continue"))
-        self.cancel_button = self.add_end_button(_("Cancel"), self.on_cancel_clicked)
-        self.source_button = self.add_end_button(_("_View source"), self.on_source_clicked)
-        self.eject_button = self.add_end_button(_("_Eject"), self.on_eject_clicked)
 
         # The cancel button doubles as 'Close' and 'Abort' depending on the state of the install
         key, mod = Gtk.accelerator_parse("Escape")
@@ -95,11 +97,27 @@ class InstallerWindow(BaseApplicationWindow,
 
         # Navigation stack
 
-        self.stack = NavigationStack(self.back_button)
+        self.stack = NavigationStack(self.back_button, cancel_button=self.cancel_button)
         self.register_page_creators()
-        self.vbox.pack_start(self.stack, True, True, 0)
+        content_area.pack_start(self.stack, True, True, 0)
 
-        self.vbox.pack_start(Gtk.HSeparator(), False, False, 0)
+        # Menu buttons
+
+        menu_icon = Gtk.Image.new_from_icon_name("open-menu-symbolic", Gtk.IconSize.MENU)
+        self.menu_button = Gtk.MenuButton(child=menu_icon)
+        self.menu_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, visible=True, halign=Gtk.Align.END)
+        self.menu_box.set_border_width(9)
+        self.menu_box.set_spacing(3)
+        self.menu_box.set_can_focus(False)
+        self.menu_button.set_popover(Gtk.Popover(child=self.menu_box, can_focus=False, relative_to=self.menu_button))
+        self.get_header_bar().pack_end(self.menu_button)
+
+        self.cache_button = self.add_menu_button(_("Configure download cache"),
+                                                 self.on_cache_clicked,
+                                                 tooltip=_(
+                                                     "Change where Lutris downloads game installer files."))
+
+        self.source_button = self.add_menu_button(_("View installer source"), self.on_source_clicked)
 
         # Pre-create some UI bits we need to refer to in several places.
         # (We lazy allocate more of it, but these are a pain.)
@@ -139,7 +157,9 @@ class InstallerWindow(BaseApplicationWindow,
             button.set_tooltip_text(tooltip)
         if handler:
             button.connect("clicked", handler)
-        self.action_buttons.pack_start(button, False, False, 0)
+
+        header_bar = self.get_header_bar()
+        header_bar.pack_start(button)
         return button
 
     def add_end_button(self, label, handler=None, tooltip=None, sensitive=True):
@@ -150,7 +170,21 @@ class InstallerWindow(BaseApplicationWindow,
             button.set_tooltip_text(tooltip)
         if handler:
             button.connect("clicked", handler)
-        self.action_buttons.pack_end(button, False, False, 0)
+
+        header_bar = self.get_header_bar()
+        header_bar.pack_end(button)
+        return button
+
+    def add_menu_button(self, label, handler=None, tooltip=None, sensitive=True):
+        """Add a button to the menu in the header bar"""
+        button = Gtk.ModelButton(label, visible=True, xalign=0.0)
+        button.set_sensitive(sensitive)
+        if tooltip:
+            button.set_tooltip_text(tooltip)
+        if handler:
+            button.connect("clicked", handler)
+
+        self.menu_box.pack_start(button, False, False, 0)
         return button
 
     @watch_errors()
@@ -171,7 +205,7 @@ class InstallerWindow(BaseApplicationWindow,
 
     @watch_errors()
     def on_cancel_clicked(self, _button=None):
-        """Ask a confirmation before cancelling the install, if it has started."""
+        """Ask a confirmation before cancelling the installation, if it has started."""
         if self.install_in_progress:
             widgets = []
 
@@ -195,9 +229,12 @@ class InstallerWindow(BaseApplicationWindow,
             if confirm_cancel_dialog.result != Gtk.ResponseType.YES:
                 logger.debug("User aborted installation cancellation")
                 return
+
             self.installer_files_box.stop_all()
             if self.interpreter:
                 self.interpreter.revert(remove_game_dir=remove_checkbox.get_active())
+        else:
+            self.installer_files_box.stop_all()
 
         if self.interpreter:
             self.interpreter.cleanup()  # still remove temporary downloads in any case
@@ -218,6 +255,7 @@ class InstallerWindow(BaseApplicationWindow,
     def set_status(self, text):
         """Display a short status text."""
         self.status_label.set_text(text)
+        self.status_label.set_visible(bool(text))
 
     def register_page_creators(self):
         self.stack.add_named_factory("choose_installer", self.create_choose_installer_page)
@@ -275,9 +313,9 @@ class InstallerWindow(BaseApplicationWindow,
     def present_choose_installer_page(self):
         """Stage where we choose an install script."""
         self.set_status("")
+        self.set_title(_("Install %s") % gtk_safe(self.installers[0]["name"]))
         self.stack.present_page("choose_installer")
-        self.display_cancel_button()
-        self.cache_button.set_sensitive(True)
+        self.display_cancel_button(extra_buttons=[self.cache_button])
 
     @watch_errors()
     def on_installer_selected(self, _widget, installer_version):
@@ -304,10 +342,11 @@ class InstallerWindow(BaseApplicationWindow,
             )
             if dlg.result == Gtk.ResponseType.YES:
                 installers = get_installers(game_slug=ex.slug)
-                self.application.show_installer_window(installers)
+                application = Gio.Application.get_default()
+                application.show_installer_window(installers)
             return
 
-        self.title_label.set_markup(_("<b>Installing {}</b>").format(gtk_safe(self.interpreter.installer.game_name)))
+        self.set_title(_("Installing {}").format(gtk_safe(self.interpreter.installer.game_name)))
         self.load_destination_page()
 
     def validate_scripts(self):
@@ -340,21 +379,21 @@ class InstallerWindow(BaseApplicationWindow,
         self.continue_button.grab_focus()
 
     def create_destination_page(self):
-        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        vbox.pack_start(self.location_entry, False, False, 5)
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        vbox.pack_start(self.location_entry, False, False, 0)
 
         desktop_shortcut_button = Gtk.CheckButton(_("Create desktop shortcut"), visible=True)
         desktop_shortcut_button.connect("clicked", self.on_create_desktop_shortcut_clicked)
-        vbox.pack_start(desktop_shortcut_button, False, False, 5)
+        vbox.pack_start(desktop_shortcut_button, False, False, 0)
 
         menu_shortcut_button = Gtk.CheckButton(_("Create application menu shortcut"), visible=True)
         menu_shortcut_button.connect("clicked", self.on_create_menu_shortcut_clicked)
-        vbox.pack_start(menu_shortcut_button, False, False, 5)
+        vbox.pack_start(menu_shortcut_button, False, False, 0)
 
         if steam_shortcut.vdf_file_exists():
             steam_shortcut_button = Gtk.CheckButton(_("Create steam shortcut"), visible=True)
             steam_shortcut_button.connect("clicked", self.on_create_steam_shortcut_clicked)
-            vbox.pack_start(steam_shortcut_button, False, False, 5)
+            vbox.pack_start(steam_shortcut_button, False, False, 0)
         return vbox
 
     def present_destination_page(self):
@@ -363,8 +402,7 @@ class InstallerWindow(BaseApplicationWindow,
         self.set_status(_("Select installation directory"))
         self.stack.present_page("destination")
         self.display_continue_button(self.on_destination_confirmed,
-                                     extra_buttons=[self.source_button])
-        self.cache_button.set_sensitive(True)
+                                     extra_buttons=[self.cache_button, self.source_button])
 
     @watch_errors()
     def on_destination_confirmed(self, _button=None):
@@ -377,7 +415,8 @@ class InstallerWindow(BaseApplicationWindow,
             if not self.interpreter.launch_install(self):
                 self.stack.navigation_reset()
 
-        self.load_spinner_page(_("Preparing Lutris for installation"), cancellable=False)
+        self.load_spinner_page(_("Preparing Lutris for installation"), cancellable=False,
+                               extra_buttons=[self.cache_button, self.source_button])
         GLib.idle_add(launch_install)
 
     @watch_errors()
@@ -469,8 +508,7 @@ class InstallerWindow(BaseApplicationWindow,
             "they will be available in the 'extras' folder where the game is installed."
         ))
         self.stack.present_page("extras")
-        self.display_continue_button(on_continue, extra_buttons=[self.source_button])
-        self.cache_button.set_sensitive(True)
+        self.display_continue_button(on_continue, extra_buttons=[self.cache_button, self.source_button])
 
     @watch_errors()
     def on_extra_toggled(self, _widget, path, model):
@@ -511,6 +549,7 @@ class InstallerWindow(BaseApplicationWindow,
             selected, _inconsistent, id_, _label = store[iter_]
             if selected and id_:
                 selected_extras.append(id_)
+
         extra_store.foreach(save_extra)
 
         self.interpreter.extras = selected_extras
@@ -559,7 +598,6 @@ class InstallerWindow(BaseApplicationWindow,
 
         self.set_status(_(
             "Please review the files needed for the installation then click 'Continue'"))
-        self.cache_button.set_sensitive(False)
         self.stack.present_page("installer_files")
         self.display_install_button(self.on_files_confirmed, sensitive=self.installer_files_box.is_ready)
 
@@ -568,7 +606,6 @@ class InstallerWindow(BaseApplicationWindow,
             self.installer_files_box.stop_all()
 
         self.set_status(_("Downloading game data"))
-        self.cache_button.set_sensitive(False)
         self.stack.present_page("installer_files")
         self.display_install_button(None, sensitive=False)
         return on_exit_page
@@ -610,7 +647,7 @@ class InstallerWindow(BaseApplicationWindow,
     # Provides a generic progress spinner and displays a status. The back button
     # is disabled for this page.
 
-    def load_spinner_page(self, status, cancellable=True):
+    def load_spinner_page(self, status, cancellable=True, extra_buttons=None):
         def present_spinner_page():
             """Show a spinner in the middle of the view"""
 
@@ -621,9 +658,9 @@ class InstallerWindow(BaseApplicationWindow,
             self.stack.present_page("spinner")
 
             if cancellable:
-                self.display_cancel_button()
+                self.display_cancel_button(extra_buttons=extra_buttons)
             else:
-                self.display_no_buttons()
+                self.display_buttons(extra_buttons or [])
 
             self.stack.set_back_allowed(False)
             return on_exit_page
@@ -676,6 +713,7 @@ class InstallerWindow(BaseApplicationWindow,
     def load_input_menu_page(self, alias, options, preselect, callback):
         def present_input_menu_page():
             """Display an input request as a dropdown menu with options."""
+
             def on_continue(_button):
                 try:
                     callback(alias, combobox)
@@ -734,34 +772,34 @@ class InstallerWindow(BaseApplicationWindow,
                     # to run, so we'll go to error page.
                     self.load_error_message_page(str(err))
 
-            vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
             label = InstallerWindow.MarkupLabel(message)
-            label.show()
-            vbox.add(label)
+            vbox.pack_start(label, False, False, 0)
 
             buttons_box = Gtk.Box()
-            buttons_box.show()
             buttons_box.set_margin_top(40)
             buttons_box.set_margin_bottom(40)
-            vbox.add(buttons_box)
+            vbox.pack_start(buttons_box, False, False, 0)
 
             autodetect_button = Gtk.Button(label=_("Autodetect"))
             autodetect_button.connect("clicked", wrapped_callback, requires)
             autodetect_button.grab_focus()
-            autodetect_button.show()
             buttons_box.pack_start(autodetect_button, True, True, 40)
 
             browse_button = Gtk.Button(label=_("Browse…"))
             callback_data = {"callback": wrapped_callback, "requires": requires}
             browse_button.connect("clicked", self.on_browse_clicked, callback_data)
-            browse_button.show()
             buttons_box.pack_start(browse_button, True, True, 40)
 
             self.stack.present_replacement_page("ask_for_disc", vbox)
             if installer.runner == "wine":
-                self.display_eject_button()
-            else:
-                self.display_cancel_button()
+                eject_button = Gtk.Button(_("Eject"), halign=Gtk.Align.END)
+                eject_button.connect("clicked", self.on_eject_clicked)
+                vbox.pack_end(eject_button, False, False, 0)
+                vbox.pack_end(Gtk.Separator(), False, False, 0)
+
+            vbox.show_all()
+            self.display_cancel_button()
 
         previous_page = self.stack.save_current_page()
         self.stack.jump_to_page(present_ask_for_disc_page)
@@ -868,7 +906,7 @@ class InstallerWindow(BaseApplicationWindow,
         """This shows the continue button, the close button, and any extra buttons you
         indicate. This will also set the label and sensitivity of the continue button.
 
-        Finallly, you cna provide the clicked handler for the continue button,
+        Finally, you cna provide the clicked handler for the continue button,
         though that can be None to leave it disconnected.
 
         We call this repeatedly, as we arrive at each page. Each call disconnects
@@ -892,23 +930,17 @@ class InstallerWindow(BaseApplicationWindow,
         else:
             self.continue_handler = None
 
-        buttons = [self.continue_button, self.cancel_button] + (extra_buttons or [])
+        buttons = [self.continue_button] + (extra_buttons or [])
         self.display_buttons(buttons)
 
     def display_install_button(self, handler, sensitive=True):
         """Displays the continue button, but labels it 'Install'."""
         self.display_continue_button(handler, continue_button_label=_(
-            "_Install"), sensitive=sensitive,
-            extra_buttons=[self.source_button])
+                                     "_Install"), sensitive=sensitive,
+                                     extra_buttons=[self.source_button])
 
-    def display_cancel_button(self):
-        self.display_buttons([self.cancel_button])
-
-    def display_eject_button(self):
-        self.display_buttons([self.eject_button, self.cancel_button])
-
-    def display_no_buttons(self):
-        self.display_buttons([])
+    def display_cancel_button(self, extra_buttons=None):
+        self.display_buttons(extra_buttons or [])
 
     def display_buttons(self, buttons):
         """Shows exactly the buttons given, and hides the others. Updates the close button
@@ -925,22 +957,28 @@ class InstallerWindow(BaseApplicationWindow,
             self.cancel_button.set_tooltip_text("")
             style_context.remove_class("destructive-action")
 
-        all_buttons = [self.eject_button,
+        all_buttons = [self.cache_button,
                        self.source_button,
-                       self.continue_button,
-                       self.cancel_button]
+                       self.continue_button]
 
         for b in all_buttons:
             b.set_visible(b in buttons)
 
+        any_visible = False
+        for b in self.menu_box.get_children():
+            if b.get_visible():
+                any_visible = True
+                break
+        self.menu_button.set_visible(any_visible)
+
     class MarkupLabel(Gtk.Label):
         """Label for installer window"""
 
-        def __init__(self, markup=None, selectable=True):
+        def __init__(self, markup=None, **kwargs):
             super().__init__(
                 label=markup,
                 use_markup=True,
                 wrap=True,
                 max_width_chars=80,
-                selectable=selectable)
+                **kwargs)
             self.set_alignment(0.5, 0)

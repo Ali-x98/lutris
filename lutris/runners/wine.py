@@ -196,6 +196,7 @@ class wine(Runner):
             },
             {
                 "option": "dxvk",
+                "section": _("Graphics"),
                 "label": _("Enable DXVK"),
                 "type": "extended_bool",
                 "callback": dxvk_vulkan_callback,
@@ -209,6 +210,7 @@ class wine(Runner):
             },
             {
                 "option": "dxvk_version",
+                "section": _("Graphics"),
                 "label": _("DXVK version"),
                 "advanced": True,
                 "type": "choice_with_entry",
@@ -218,6 +220,7 @@ class wine(Runner):
 
             {
                 "option": "vkd3d",
+                "section": _("Graphics"),
                 "label": _("Enable VKD3D"),
                 "type": "extended_bool",
                 "callback": dxvk_vulkan_callback,
@@ -230,6 +233,7 @@ class wine(Runner):
             },
             {
                 "option": "vkd3d_version",
+                "section": _("Graphics"),
                 "label": _("VKD3D version"),
                 "advanced": True,
                 "type": "choice_with_entry",
@@ -238,6 +242,7 @@ class wine(Runner):
             },
             {
                 "option": "d3d_extras",
+                "section": _("Graphics"),
                 "label": _("Enable D3D Extras"),
                 "type": "bool",
                 "default": True,
@@ -249,6 +254,7 @@ class wine(Runner):
             },
             {
                 "option": "d3d_extras_version",
+                "section": _("Graphics"),
                 "label": _("D3D Extras version"),
                 "advanced": True,
                 "type": "choice_with_entry",
@@ -257,6 +263,7 @@ class wine(Runner):
             },
             {
                 "option": "dxvk_nvapi",
+                "section": _("Graphics"),
                 "label": _("Enable DXVK-NVAPI / DLSS"),
                 "type": "bool",
                 "default": True,
@@ -267,6 +274,7 @@ class wine(Runner):
             },
             {
                 "option": "dxvk_nvapi_version",
+                "section": _("Graphics"),
                 "label": _("DXVK NVAPI version"),
                 "advanced": True,
                 "type": "choice_with_entry",
@@ -275,6 +283,7 @@ class wine(Runner):
             },
             {
                 "option": "dgvoodoo2",
+                "section": _("Graphics"),
                 "label": _("Enable dgvoodoo2"),
                 "type": "bool",
                 "default": False,
@@ -287,6 +296,7 @@ class wine(Runner):
             },
             {
                 "option": "dgvoodoo2_version",
+                "section": _("Graphics"),
                 "label": _("dgvoodoo2 version"),
                 "advanced": True,
                 "type": "choice_with_entry",
@@ -355,6 +365,7 @@ class wine(Runner):
             },
             {
                 "option": "Desktop",
+                "section": _("Virtual Desktop"),
                 "label": _("Windowed (virtual desktop)"),
                 "type": "bool",
                 "default": False,
@@ -366,6 +377,7 @@ class wine(Runner):
             },
             {
                 "option": "WineDesktop",
+                "section": _("Virtual Desktop"),
                 "label": _("Virtual desktop resolution"),
                 "type": "choice_with_entry",
                 "choices": DISPLAY_MANAGER.get_resolutions,
@@ -373,6 +385,7 @@ class wine(Runner):
             },
             {
                 "option": "Dpi",
+                "section": _("DPI"),
                 "label": _("Enable DPI Scaling"),
                 "type": "bool",
                 "default": False,
@@ -383,6 +396,7 @@ class wine(Runner):
             },
             {
                 "option": "ExplicitDpi",
+                "section": _("DPI"),
                 "label": _("DPI"),
                 "type": "string",
                 "help": _(
@@ -468,6 +482,7 @@ class wine(Runner):
             {
                 "option": "sandbox",
                 "type": "bool",
+                "section": _("Sandbox"),
                 "label": _("Create a sandbox for Wine folders"),
                 "default": True,
                 "advanced": True,
@@ -480,6 +495,7 @@ class wine(Runner):
             {
                 "option": "sandbox_dir",
                 "type": "directory_chooser",
+                "section": _("Sandbox"),
                 "label": _("Sandbox directory"),
                 "help": _("Custom directory for desktop integration folders."),
                 "advanced": True,
@@ -801,28 +817,6 @@ class wine(Runner):
 
         return None
 
-    def setup_dlls(self, manager_class, enable, version):
-        """Enable or disable DLLs"""
-        dll_manager = manager_class(
-            self.prefix_path,
-            arch=self.wine_arch,
-            version=version,
-        )
-
-        # manual version only sets the dlls to native
-        manager_version = dll_manager.version
-        if not manager_version or manager_version.lower() != "manual":
-            if enable:
-                dll_manager.enable()
-            else:
-                dll_manager.disable()
-
-        if enable:
-            for dll in dll_manager.managed_dlls:
-                # We have to make sure that the dll exists before setting it to native
-                if dll_manager.dll_exists(dll):
-                    self.dll_overrides[dll] = "n"
-
     def prelaunch(self):
         if not system.path_exists(os.path.join(self.prefix_path, "user.reg")):
             logger.warning("No valid prefix detected in %s, creating one...", self.prefix_path)
@@ -835,31 +829,35 @@ class wine(Runner):
         self.sandbox(prefix_manager)
         self.set_regedit_keys()
 
-        self.setup_dlls(
-            DXVKManager,
-            bool(self.runner_config.get("dxvk")),
-            self.runner_config.get("dxvk_version")
-        )
-        self.setup_dlls(
-            VKD3DManager,
-            bool(self.runner_config.get("vkd3d")),
-            self.runner_config.get("vkd3d_version")
-        )
-        self.setup_dlls(
-            DXVKNVAPIManager,
-            bool(self.runner_config.get("dxvk_nvapi")),
-            self.runner_config.get("dxvk_nvapi_version")
-        )
-        self.setup_dlls(
-            D3DExtrasManager,
-            bool(self.runner_config.get("d3d_extras")),
-            self.runner_config.get("d3d_extras_version")
-        )
-        self.setup_dlls(
-            dgvoodoo2Manager,
-            bool(self.runner_config.get("dgvoodoo2")),
-            self.runner_config.get("dgvoodoo2_version")
-        )
+        for manager, enabled in self.get_dll_managers().items():
+            manager.setup(enabled)
+
+    def get_dll_managers(self, enabled_only=False):
+        """Returns the DLL managers in a dict; the keys are the managers themselves,
+        and the values are the enabled flags for them. If 'enabled_only' is true,
+        only enabled managers are returned, so disabled managers are not created."""
+        manager_classes = [
+            (DXVKManager, "dxvk", "dxvk_version"),
+            (VKD3DManager, "vkd3d", "vkd3d_version"),
+            (DXVKNVAPIManager, "dxvk_nvapi", "dxvk_nvapi_version"),
+            (D3DExtrasManager, "d3d_extras", "d3d_extras_version"),
+            (dgvoodoo2Manager, "dgvoodoo2", "dgvoodoo2_version")
+        ]
+
+        managers = {}
+
+        for manager_class, enabled_option, version_option in manager_classes:
+            enabled = bool(self.runner_config.get(enabled_option))
+            version = self.runner_config.get(version_option)
+            if enabled or not enabled_only:
+                manager = manager_class(
+                    self.prefix_path,
+                    arch=self.wine_arch,
+                    version=version
+                )
+                managers[manager] = enabled
+
+        return managers
 
     def get_dll_overrides(self):
         """Return the DLLs overriden at runtime"""
@@ -914,9 +912,13 @@ class wine(Runner):
         if self.runner_config.get("eac"):
             env["PROTON_EAC_RUNTIME"] = os.path.join(settings.RUNTIME_DIR, "eac_runtime")
 
+        for dll_manager in self.get_dll_managers(enabled_only=True):
+            self.dll_overrides.update(dll_manager.get_enabling_dll_overrides())
+
         overrides = self.get_dll_overrides()
         if overrides:
             self.dll_overrides.update(overrides)
+
         env["WINEDLLOVERRIDES"] = get_overrides_env(self.dll_overrides)
 
         # Proton support

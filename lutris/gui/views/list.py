@@ -22,8 +22,8 @@ class GameListView(Gtk.TreeView, GameView):
     __gsignals__ = GameView.__gsignals__
 
     def __init__(self, store):
-        super().__init__()
-        GameView.__init__(self)
+        Gtk.TreeView.__init__(self)
+        GameView.__init__(self, store.service)
 
         self.set_rules_hint(True)
 

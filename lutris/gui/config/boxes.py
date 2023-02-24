@@ -18,7 +18,6 @@ from lutris.util.log import logger
 
 
 class ConfigBox(VBox):
-
     """Dynamically generate a vbox built upon on a python dict."""
 
     config_section = NotImplemented
@@ -77,6 +76,9 @@ class ConfigBox(VBox):
             self.config = self.lutris_config.system_config
             self.raw_config = self.lutris_config.raw_system_config
 
+        current_section = None
+        current_vbox = self
+
         # Go thru all options.
         for option in self.options:
             if "scope" in option:
@@ -90,6 +92,15 @@ class ConfigBox(VBox):
                 option["choices"] = option["choices"]()
             if callable(option.get("condition")):
                 option["condition"] = option["condition"]()
+
+            if option.get("section") != current_section:
+                current_section = option.get("section")
+                if current_section:
+                    frame = ConfigBox.SectionFrame(current_section)
+                    current_vbox = frame.vbox
+                    self.pack_start(frame, False, False, 0)
+                else:
+                    current_vbox = self
 
             self.wrapper = Gtk.Box()
             self.wrapper.set_spacing(12)
@@ -140,7 +151,7 @@ class ConfigBox(VBox):
                 self.wrapper.props.has_tooltip = True
                 self.wrapper.connect("query-tooltip", self.on_query_tooltip, helptext)
 
-            hbox = Gtk.Box()
+            hbox = Gtk.Box(visible=True)
             hbox.set_margin_left(18)
             hbox.pack_end(placeholder, False, False, 5)
             # Grey out option if condition unmet
@@ -150,13 +161,37 @@ class ConfigBox(VBox):
             # Hide if advanced
             if option.get("advanced"):
                 hbox.get_style_context().add_class("advanced")
-                show_advanced = settings.read_setting("show_advanced_options")
-                if show_advanced != "True":
-                    hbox.set_no_show_all(True)
             hbox.pack_start(self.wrapper, True, True, 0)
-            self.pack_start(hbox, False, False, 0)
+            current_vbox.pack_start(hbox, False, False, 0)
 
         self.show_all()
+
+        show_advanced = settings.read_setting("show_advanced_options") == "True"
+        self.set_advanced_visibility(show_advanced)
+
+    def set_advanced_visibility(self, value):
+        """Sets the visibility of every 'advanced' option and every section that
+        contains only 'advanced' options."""
+
+        def update_widgets(widgets):
+            visible_count = 0
+            for widget in widgets:
+                if isinstance(widget, ConfigBox.SectionFrame):
+                    frame_visible_count = update_widgets(widget.vbox.get_children())
+                    visible_count += frame_visible_count
+                    widget.set_visible(frame_visible_count > 0)
+                    widget.set_frame_visible(frame_visible_count > 1)
+                else:
+                    widget_visible = value or not widget.get_style_context().has_class("advanced")
+                    widget.set_visible(widget_visible)
+                    widget.set_no_show_all(not widget_visible)
+                    if widget_visible:
+                        visible_count += 1
+                        widget.show_all()
+
+            return visible_count
+
+        update_widgets(self.get_children())
 
     def call_widget_generator(self, option, option_key, value, default):  # noqa: C901
         """Call the right generation method depending on option type."""
@@ -609,6 +644,30 @@ class ConfigBox(VBox):
         style_context = wrapper.get_style_context()
         style_context.add_provider(style_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
+    class SectionFrame(Gtk.Frame):
+        """A frame that is styled to have particular margins, and can have its frame hidden.
+        This leaves the content but removes the margins and borders and all that, so it looks
+        like the frame was never there."""
+
+        def __init__(self, section):
+            super().__init__(label=section)
+            self.section = section
+            self.vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            self.add(self.vbox)
+            self.get_style_context().add_class("section-frame")
+
+        def set_frame_visible(self, visible):
+            if visible:
+                self.show_frame()
+            else:
+                self.hide_frame()
+
+        def show_frame(self):
+            self.get_style_context().remove_class("frame-hidden")
+
+        def hide_frame(self):
+            self.get_style_context().add_class("frame-hidden")
+
 
 class GameBox(ConfigBox):
     config_section = "game"
@@ -631,7 +690,6 @@ class GameBox(ConfigBox):
 
 
 class RunnerBox(ConfigBox):
-
     """Configuration box for runner specific options"""
 
     config_section = "runner"

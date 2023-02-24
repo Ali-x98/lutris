@@ -1,22 +1,29 @@
 """Options list for system config."""
+import functools
 import glob
 import os
+import re
+import shutil
 import subprocess
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict
 from gettext import gettext as _
 
 from lutris import runners
 from lutris.util import linux, system
-from lutris.util.display import DISPLAY_MANAGER, SCREEN_SAVER_INHIBITOR, USE_DRI_PRIME, has_graphic_adapter_description
+from lutris.util.display import DISPLAY_MANAGER, SCREEN_SAVER_INHIBITOR, USE_DRI_PRIME
+from lutris.util.log import logger
 
-VULKAN_DATA_DIRS = [
-    "/usr/local/etc/vulkan",  # standard site-local location
-    "/usr/local/share/vulkan",  # standard site-local location
-    "/etc/vulkan",  # standard location
-    "/usr/share/vulkan",  # standard location
-    "/usr/lib/x86_64-linux-gnu/GL/vulkan",  # Flatpak GL extension
-    "/usr/lib/i386-linux-gnu/GL/vulkan",  # Flatpak GL32 extension
-    "/opt/amdgpu-pro/etc/vulkan"  # AMD GPU Pro - TkG
+# vulkan dirs used by distros or containers that aren't from:
+# https://github.com/KhronosGroup/Vulkan-Loader/blob/v1.3.235/docs/LoaderDriverInterface.md#driver-discovery-on-linux
+# don't include the /vulkan suffix
+FALLBACK_VULKAN_DATA_DIRS = [
+    "/usr/local/etc",  # standard site-local location
+    "/usr/local/share",  # standard site-local location
+    "/etc",  # standard location
+    "/usr/share",  # standard location
+    "/usr/lib/x86_64-linux-gnu/GL",  # Flatpak GL extension
+    "/usr/lib/i386-linux-gnu/GL",  # Flatpak GL32 extension
+    "/opt/amdgpu-pro/etc"  # AMD GPU Pro - TkG
 ]
 
 
@@ -82,13 +89,92 @@ def get_optirun_choices():
     return choices
 
 
-def get_gpu_vendor_cmd(is_nvidia):
-    """Run glxinfo command to get vendor based on certain conditions"""
-    if is_nvidia:
-        return "__GLX_VENDOR_LIBRARY_NAME=nvidia glxinfo | grep -i opengl | grep -i vendor"
+# cache this to avoid calling vulkaninfo repeatedly, shouldn't change at runtime
+@functools.lru_cache
+def get_vulkan_gpus(icd_files):
+    """Runs vulkaninfo to determine the default and DRI_PRIME gpu if available"""
+
+    if not shutil.which("vulkaninfo"):
+        logger.warning("vulkaninfo not available, unable to list GPUs")
+        return "Unknown GPU"
+
+    gpu = get_vulkan_gpu(icd_files, False)
     if USE_DRI_PRIME:
-        return "DRI_PRIME=1 glxinfo | grep -i opengl | grep -i vendor"
-    return "glxinfo | grep -i opengl | grep -i vendor"
+        prime_gpu = get_vulkan_gpu(icd_files, True)
+        if prime_gpu != gpu:
+            gpu += f" (Discrete GPU: {prime_gpu})"
+    return gpu
+
+
+def get_vulkan_gpu(icd_files, prime):
+    """Runs vulkaninfo to find the primary GPU"""
+
+    subprocess_env = dict(os.environ)
+    if icd_files:
+        subprocess_env["VK_DRIVER_FILES"] = icd_files
+        subprocess_env["VK_ICD_FILENAMES"] = icd_files
+    if prime:
+        subprocess_env["DRI_PRIME"] = "1"
+
+    infocmd = "vulkaninfo --summary | grep deviceName | head -n 1 | tr -s '[:blank:]' | cut -d ' ' -f 3-"
+    with subprocess.Popen(infocmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          env=subprocess_env) as infoget:
+        result = infoget.communicate()[0].decode("utf-8").strip()
+    if "Failed to detect any valid GPUs" in result or "ERROR: [Loader Message]" in result:
+        return "No GPU"
+    # Shorten result to just the friendly name of the GPU
+    # vulkaninfo returns Vendor Friendly Name (Chip Developer Name)
+    # AMD Radeon Pro W6800 (RADV NAVI21) -> AMD Radeon Pro W6800
+    return re.sub(r"\s*\(.*?\)", "", result)
+
+
+def get_vk_icd_files():
+    """Returns available vulkan ICD files in the same search order as vulkan-loader"""
+    all_icd_search_paths = []
+
+    def add_icd_search_path(paths):
+        if paths:
+            # unixy env vars with multiple paths are : delimited
+            for path in paths.split(":"):
+                path = os.path.join(path, "vulkan")
+                if os.path.exists(path) and path not in all_icd_search_paths:
+                    all_icd_search_paths.append(path)
+
+    # Must match behavior of
+    # https://github.com/KhronosGroup/Vulkan-Loader/blob/v1.3.235/docs/LoaderDriverInterface.md#driver-discovery-on-linux
+    # (or a newer version of the same standard)
+
+    # 1.a XDG_CONFIG_HOME or ~/.config if unset
+    add_icd_search_path(os.getenv("XDG_CONFIG_HOME") or (f"{os.getenv('HOME')}/.config"))
+    # 1.b XDG_CONFIG_DIRS
+    add_icd_search_path(os.getenv("XDG_CONFIG_DIRS") or "/etc/xdg")
+
+    # 2, 3 SYSCONFDIR and EXTRASYSCONFDIR
+    # Compiled in default has both the same
+    add_icd_search_path("/etc")
+
+    # 4 XDG_DATA_HOME
+    add_icd_search_path(os.getenv("XDG_DATA_HOME") or (f"{os.getenv('HOME')}/.local/share"))
+
+    # 5 XDG_DATA_DIRS or fall back to /usr/local/share and /usr/share
+    add_icd_search_path(os.getenv("XDG_DATA_DIRS") or "/usr/local/share:/usr/share")
+
+    # FALLBACK
+    # dirs that aren't from the loader spec are searched last
+    for fallback_dir in FALLBACK_VULKAN_DATA_DIRS:
+        add_icd_search_path(fallback_dir)
+
+    all_icd_files = []
+
+    for data_dir in all_icd_search_paths:
+        path = os.path.join(data_dir, "icd.d", "*.json")
+        # sort here as directory enumeration order is not guaranteed in linux
+        # so it's consistent every time
+        icd_files = sorted(glob.glob(path))
+        if icd_files:
+            all_icd_files += icd_files
+
+    return all_icd_files
 
 
 def get_vk_icd_choices():
@@ -98,78 +184,38 @@ def get_vk_icd_choices():
     nvidia = []
     amdvlk = []
     amdvlkpro = []
-    icd_files = defaultdict(list)
-    # Add loaders
-    for data_dir in VULKAN_DATA_DIRS:
-        path = os.path.join(data_dir, "icd.d", "*.json")
-        for loader in glob.glob(path):
-            icd_key = os.path.basename(loader).split(".")[0]
-            icd_files[icd_key].append(os.path.join(path, loader))
-            if "intel" in loader:
-                intel.append(loader)
-            elif "radeon" in loader:
-                amdradv.append(loader)
-            elif "nvidia" in loader:
-                nvidia.append(loader)
-            elif "amd" in loader:
-                if "pro" in loader:
-                    amdvlkpro.append(loader)
-                else:
-                    amdvlk.append(loader)
+    # fallback in case any ICDs don't match a known type
+    unknown = []
+
+    all_icd_files = get_vk_icd_files()
+
+    # Add loaders for each vendor
+    for loader in all_icd_files:
+        if "intel" in loader:
+            intel.append(loader)
+        elif "radeon" in loader:
+            amdradv.append(loader)
+        elif "nvidia" in loader:
+            nvidia.append(loader)
+        elif "amd" in loader:
+            if "pro" in loader:
+                amdvlkpro.append(loader)
+            else:
+                amdvlk.append(loader)
+        else:
+            unknown.append(loader)
 
     intel_files = ":".join(intel)
     amdradv_files = ":".join(amdradv)
     nvidia_files = ":".join(nvidia)
     amdvlk_files = ":".join(amdvlk)
     amdvlkpro_files = ":".join(amdvlkpro)
+    unknown_files = ":".join(unknown)
 
-    # Start the 'choices' with an 'auto' choice. But which one?
-    auto_intel_name = _("Auto: Intel Open Source (MESA: ANV)")
-    auto_amdradv_name = _("Auto: AMD RADV Open Source (MESA: RADV)")
-    auto_nvidia_name = _("Auto: Nvidia Proprietary")
-
-    vk_icd_filenames = os.getenv("VK_ICD_FILENAMES")
-    if vk_icd_filenames:
-        # VK_ICD_FILENAMES is what we are going to set in the end, so
-        # if it starts out set, the 'Auto' choice should always leave it
-        # alone- but we do want to pick a nice name for it.
-        #
-        # Note that when the choice is "", we just leave VK_ICD_FILENAMES
-        # alone and do not overwrite it.
-        if "intel" in vk_icd_filenames:
-            choices = [(auto_intel_name, "")]
-        elif "radeon" in vk_icd_filenames or "amd" in vk_icd_filenames or "pro" in vk_icd_filenames:
-            choices = [(auto_amdradv_name, "")]
-        elif "nvidia" in vk_icd_filenames:
-            choices = [(auto_nvidia_name, "")]
-        else:
-            choices = [(_("Auto: WARNING -- No Vulkan Loader detected!"), "")]
-    else:
-        # Without VK_ICD_FILENAMES, we'll try to figure out what GPU the
-        # user has installed and which has ICD files. If that fails, we'll
-        # just use blank and hope for the best.
-        choices = [(_("Auto: WARNING -- No Vulkan Loader detected!"), "")]
-
-        glxinfocmd = get_gpu_vendor_cmd(bool(nvidia_files))
-        with subprocess.Popen(glxinfocmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as glxvendorget:
-            glxvendor = glxvendorget.communicate()[0].decode("utf-8")
-        default_gpu = glxvendor
-
-        if "Intel" in default_gpu and intel_files:
-            choices = [(auto_intel_name, intel_files)]
-        elif "AMD" in default_gpu and amdradv_files:
-            choices = [(auto_amdradv_name, amdradv_files)]
-        elif "NVIDIA" in default_gpu and intel_files:
-            choices = [(auto_nvidia_name, nvidia_files)]
-        elif USE_DRI_PRIME:
-            # We have multiple video chipsets, pick something that is instlaled if possible;
-            # we prefer NVIDIA and AMD over Intel, because don't we all?
-            if nvidia_files and has_graphic_adapter_description("NVIDIA"):
-                choices = [(auto_nvidia_name, nvidia_files)]
-            elif amdradv_files and has_graphic_adapter_description("AMD"):
-                choices = [(auto_amdradv_name, amdradv_files)]
-            elif intel_files and has_graphic_adapter_description("Intel"):
-                choices = [(auto_intel_name, intel_files)]
+    # default choice should always be blank so the env var gets left as is
+    # This ensures Lutris doesn't change the vulkan loader behavior unless you select
+    # a specific ICD from the list, to avoid surprises
+    choices = [("Unspecified", "")]
 
     if intel_files:
         choices.append(("Intel Open Source (MESA: ANV)", intel_files))
@@ -184,12 +230,17 @@ def get_vk_icd_choices():
             choices.append(("AMDVLK Open source", amdvlk_files))
     if amdvlkpro_files:
         choices.append(("AMDGPU-PRO Proprietary", amdvlkpro_files))
-    choices.append((_("Unspecified (Use System Default)"), ""))
+    if unknown:
+        choices.append(("Unknown Vendor", unknown_files))
+
+    choices = [(prefix + ": " + get_vulkan_gpus(files), files) for prefix, files in choices]
+
     return choices
 
 
 system_options = [  # pylint: disable=invalid-name
     {
+        "section": "Lutris",
         "option": "game_path",
         "type": "directory_chooser",
         "label": _("Default installation folder"),
@@ -198,19 +249,17 @@ system_options = [  # pylint: disable=invalid-name
         "help": _("The default folder where you install your games.")
     },
     {
-        "option":
-        "disable_runtime",
-        "type":
-        "bool",
-        "label":
-        _("Disable Lutris Runtime"),
-        "default":
-        False,
+        "section": "Lutris",
+        "option": "disable_runtime",
+        "type": "bool",
+        "label": _("Disable Lutris Runtime"),
+        "default": False,
         "help": _("The Lutris Runtime loads some libraries before running the "
                   "game, which can cause some incompatibilities in some cases. "
                   "Check this option to disable it."),
     },
     {
+        "section": "Lutris",
         "option": "prefer_system_libs",
         "type": "bool",
         "label": _("Prefer system libraries"),
@@ -218,7 +267,131 @@ system_options = [  # pylint: disable=invalid-name
         "help": _("When the runtime is enabled, prioritize the system libraries"
                   " over the provided ones."),
     },
+
     {
+        "section": "Gamescope",
+        "option": "gamescope",
+        "type": "bool",
+        "label": _("Enable Gamescope"),
+        "default": False,
+        "condition": bool(system.find_executable("gamescope")) and linux.LINUX_SYSTEM.nvidia_gamescope_support(),
+        "help": _("Use gamescope to draw the game window isolated from your desktop.\n"
+                  "Toggle fullscreen: Super + F"),
+    },
+    {
+        "section": "Gamescope",
+        "option": "gamescope_force_grab_cursor",
+        "type": "bool",
+        "label": _("Relative Mouse Mode"),
+        "advanced": True,
+        "default": False,
+        "condition": bool(system.find_executable("gamescope")),
+        "help": _("Always use relative mouse mode instead of flipping\n"
+                  "dependent on cursor visibility (--force-grab-cursor).\n"
+                  "(Since gamescope git commit 054458f, Jan 12, 2023)"),
+    },
+    {
+        "section": "Gamescope",
+        "option": "gamescope_output_res",
+        "type": "choice_with_entry",
+        "label": _("Output Resolution"),
+        "choices": DISPLAY_MANAGER.get_resolutions,
+        "advanced": True,
+        "condition": bool(system.find_executable("gamescope")),
+        "help": _("Set the resolution used by gamescope (-W, -H).\n"
+                  "Resizing the gamescope window will update these settings.\n"
+                  "\n"
+                  "<b>Empty string:</b> Disabled\n"
+                  "<b>Custom Resolutions:</b> (width)x(height)"),
+    },
+    {
+        "section": "Gamescope",
+        "option": "gamescope_game_res",
+        "type": "choice_with_entry",
+        "label": _("Game Resolution"),
+        "advanced": True,
+        "choices": DISPLAY_MANAGER.get_resolutions,
+        "condition": bool(system.find_executable("gamescope")),
+        "help": _("Set the maximum resolution used by the game (-w, -h).\n"
+                  "\n"
+                  "<b>Empty string:</b> Disabled\n"
+                  "<b>Custom Resolutions:</b> (width)x(height)"),
+    },
+    {
+        "section": "Gamescope",
+        "option": "gamescope_window_mode",
+        "label": _("Window Mode"),
+        "advanced": True,
+        "type": "choice",
+        "choices": (
+            (_("Fullscreen"), "-f"),
+            (_("Windowed"), ""),
+            (_("Borderless"), "-b"),
+        ),
+        "default": "",
+        "condition": bool(system.find_executable("gamescope")),
+        "help": _("Run gamescope in fullscreen, windowed or borderless mode\n"
+                  "Toggle fullscreen (-f) : Super + F"),
+    },
+    {
+        "section": "Gamescope",
+        "option": "gamescope_fsr_sharpness",
+        "label": _("FSR Level"),
+        "advanced": True,
+        "type": "string",
+        "condition": bool(system.find_executable("gamescope")),
+        "help": _("Use AMD FidelityFX™ Super Resolution 1.0 for upscaling (-U).\n"
+                  "Upscaler sharpness from 0 (max) to 20 (min).\n"
+                  "\n"
+                  "<b>Empty string:</b> Disabled"),
+    },
+    {
+        "section": "Gamescope",
+        "option": "gamescope_fps_limiter",
+        "label": _("FPS Limiter"),
+        "advanced": True,
+        "type": "string",
+        "condition": bool(system.find_executable("gamescope")),
+        "help": _("Set a frame-rate limit for gamescope specified in frames per second (-r).\n"
+                  "\n"
+                  "<b>Empty string:</b> Disabled"),
+    },
+    {
+        "section": "CPU",
+        "option": "single_cpu",
+        "type": "bool",
+        "label": _("Restrict number of cores used"),
+        "default": False,
+        "help": _("Restrict the game to a maximum number of CPU cores."),
+    },
+    {
+        "section": "CPU",
+        "option": "limit_cpu_count",
+        "type": "string",
+        "label": _("Restrict number of cores to"),
+        "default": "1",
+        "help": _("Maximum number of CPU cores to be used, if 'Restrict number of cores used' is turned on."),
+    },
+    {
+        "section": "CPU",
+        "option": "gamemode",
+        "type": "bool",
+        "default": linux.LINUX_SYSTEM.gamemode_available(),
+        "condition": linux.LINUX_SYSTEM.gamemode_available(),
+        "label": _("Enable Feral GameMode"),
+        "help": _("Request a set of optimisations be temporarily applied to the host OS"),
+    },
+    {
+        "section": "Display",
+        "option": "mangohud",
+        "type": "bool",
+        "label": _("FPS counter (MangoHud)"),
+        "default": False,
+        "condition": bool(system.find_executable("mangohud")),
+        "help": _("Display the game's FPS + other information. Requires MangoHud to be installed."),
+    },
+    {
+        "section": "Display",
         "option": "reset_desktop",
         "type": "bool",
         "label": _("Restore resolution on game exit"),
@@ -228,50 +401,7 @@ system_options = [  # pylint: disable=invalid-name
                   "into play to save your bacon."),
     },
     {
-        "option": "gamescope",
-        "type": "bool",
-        "label": _("Enable gamescope"),
-        "default": False,
-        "advanced": True,
-        "condition": bool(system.find_executable("gamescope")) and linux.LINUX_SYSTEM.nvidia_gamescope_support(),
-        "help": _("Use gamescope to draw the game window isolated from your desktop.\n"
-                  "Use Ctrl+Super+F to toggle fullscreen"),
-    },
-    {
-        "option": "gamescope_output_res",
-        "type": "string",
-        "label": _("Gamescope output resolution"),
-        "default": False,
-        "advanced": True,
-        "condition": bool(system.find_executable("gamescope")),
-        "help": _("Resolution of the window on your desktop"),
-    },
-    {
-        "option": "gamescope_game_res",
-        "type": "string",
-        "label": _("Gamescope game resolution"),
-        "default": False,
-        "advanced": True,
-        "condition": bool(system.find_executable("gamescope")),
-        "help": _("Resolution of the screen visible to the game"),
-    },
-    {
-        "option": "single_cpu",
-        "type": "bool",
-        "label": _("Restrict number of cores used"),
-        "advanced": True,
-        "default": False,
-        "help": _("Restrict the game to a maximum number of CPU cores."),
-    },
-    {
-        "option": "limit_cpu_count",
-        "type": "string",
-        "label": _("Restrict number of cores to"),
-        "advanced": True,
-        "default": "1",
-        "help": _("Maximum number of CPU cores to be used, if 'Restrict number of cores used' is turned on."),
-    },
-    {
+        "section": "Display",
         "option": "restore_gamma",
         "type": "bool",
         "default": False,
@@ -281,6 +411,7 @@ system_options = [  # pylint: disable=invalid-name
                   "your display too bright. Select this option to correct it."),
     },
     {
+        "section": "Display",
         "option": "disable_compositor",
         "label": _("Disable desktop effects"),
         "type": "bool",
@@ -290,6 +421,7 @@ system_options = [  # pylint: disable=invalid-name
                   "reducing stuttering and increasing performance"),
     },
     {
+        "section": "Display",
         "option": "disable_screen_saver",
         "label": _("Disable screen saver"),
         "type": "bool",
@@ -300,7 +432,54 @@ system_options = [  # pylint: disable=invalid-name
                   "Requires the screen saver's functionality "
                   "to be exposed over DBus."),
     },
+
     {
+        "section": "Display",
+        "option": "fps_limit",
+        "type": "string",
+        "size": "small",
+        "label": _("FPS limit"),
+        "condition": bool(system.find_executable("strangle")),
+        "help": _("Limit the game's FPS to desired number"),
+    },
+    {
+        "section": "Display",
+        "option": "sdl_video_fullscreen",
+        "type": "choice",
+        "label": _("SDL 1.2 Fullscreen Monitor"),
+        "choices": get_output_list,
+        "default": "off",
+        "advanced": True,
+        "help": _("Hint SDL 1.2 games to use a specific monitor when going "
+                  "fullscreen by setting the SDL_VIDEO_FULLSCREEN "
+                  "environment variable"),
+    },
+    {
+        "section": "Display",
+        "option": "display",
+        "type": "choice",
+        "label": _("Turn off monitors except"),
+        "choices": get_output_choices,
+        "condition": linux.LINUX_SYSTEM.display_server != "wayland",
+        "default": "off",
+        "advanced": True,
+        "help": _("Only keep the selected screen active while the game is "
+                  "running. \n"
+                  "This is useful if you have a dual-screen setup, and are \n"
+                  "having display issues when running a game in fullscreen."),
+    },
+    {
+        "section": "Display",
+        "option": "resolution",
+        "type": "choice",
+        "label": _("Switch resolution to"),
+        "choices": get_resolution_choices,
+        "condition": linux.LINUX_SYSTEM.display_server != "wayland",
+        "default": "off",
+        "help": _("Switch to this screen resolution while the game is running."),
+    },
+    {
+        "section": "Audio",
         "option": "reset_pulse",
         "type": "bool",
         "label": _("Reset PulseAudio"),
@@ -310,6 +489,7 @@ system_options = [  # pylint: disable=invalid-name
         "help": _("Restart PulseAudio before launching the game."),
     },
     {
+        "section": "Audio",
         "option": "pulse_latency",
         "type": "bool",
         "label": _("Reduce PulseAudio latency"),
@@ -320,6 +500,7 @@ system_options = [  # pylint: disable=invalid-name
                   "to improve audio quality on some games"),
     },
     {
+        "section": "Input",
         "option": "use_us_layout",
         "type": "bool",
         "label": _("Switch to US keyboard layout"),
@@ -328,6 +509,51 @@ system_options = [  # pylint: disable=invalid-name
         "help": _("Switch to US keyboard QWERTY layout while game is running"),
     },
     {
+        "section": "Input",
+        "option": "antimicro_config",
+        "type": "file",
+        "label": _("AntiMicroX Profile"),
+        "advanced": True,
+        "help": _("Path to an AntiMicroX profile file"),
+    },
+
+    {
+        "section": "Input",
+        "option": "sdl_gamecontrollerconfig",
+        "type": "string",
+        "label": _("SDL2 gamepad mapping"),
+        "advanced": True,
+        "help": _("SDL_GAMECONTROLLERCONFIG mapping string or path to a custom "
+                  "gamecontrollerdb.txt file containing mappings."),
+    },
+    {
+        "section": "Multi-GPU",
+        "option": "prime",
+        "type": "bool",
+        "default": False,
+        "condition": True,
+        "label": _("Enable NVIDIA Prime Render Offload"),
+        "help": _("If you have the latest NVIDIA driver and the properly patched xorg-server (see "
+                  "https://download.nvidia.com/XFree86/Linux-x86_64/435.17/README/primerenderoffload.html"
+                  "), you can launch a game on your NVIDIA GPU by toggling this switch. This will apply "
+                  "__NV_PRIME_RENDER_OFFLOAD=1 and "
+                  "__GLX_VENDOR_LIBRARY_NAME=nvidia environment variables.")
+    },
+    {
+        "section": "Multi-GPU",
+        "option": "dri_prime",
+        "type": "bool",
+        "default": USE_DRI_PRIME,
+        "condition": USE_DRI_PRIME,
+        "label": _("Use discrete graphics"),
+        "advanced": True,
+        "help": _("If you have open source graphic drivers (Mesa), selecting this "
+                  "option will run the game with the 'DRI_PRIME=1' environment variable, "
+                  "activating your discrete graphic chip for high 3D "
+                  "performance."),
+    },
+    {
+        "section": "Multi-GPU",
         "option": "optimus",
         "type": "choice",
         "default": "off",
@@ -342,9 +568,12 @@ system_options = [  # pylint: disable=invalid-name
                   "Primus VK provide vulkan support under bumblebee."),
     },
     {
+        "section": "Multi-GPU",
         "option": "vk_icd",
         "type": "choice",
-        "default": get_vk_icd_choices()[0][1],
+        # Default is "" which does not set the VK_ICD_FILENAMES env var
+        # (Matches "Unspecified" in dropdown)
+        "default": "",
         "choices": get_vk_icd_choices,
         "label": _("Vulkan ICD loader"),
         "advanced": True,
@@ -354,88 +583,7 @@ system_options = [  # pylint: disable=invalid-name
                   "across these drivers.")
     },
     {
-        "option": "mangohud",
-        "type": "bool",
-        "label": _("FPS counter (MangoHud)"),
-        "default": False,
-        "condition": bool(system.find_executable("mangohud")),
-        "help": _("Display the game's FPS + other information. Requires MangoHud to be installed."),
-    },
-    {
-        "option": "fps_limit",
-        "type": "string",
-        "size": "small",
-        "label": _("FPS limit"),
-        "advanced": True,
-        "condition": bool(system.find_executable("strangle")),
-        "help": _("Limit the game's FPS to desired number"),
-    },
-    {
-        "option": "gamemode",
-        "type": "bool",
-        "default": linux.LINUX_SYSTEM.gamemode_available(),
-        "condition": linux.LINUX_SYSTEM.gamemode_available(),
-        "label": _("Enable Feral GameMode"),
-        "help": _("Request a set of optimisations be temporarily applied to the host OS"),
-    },
-    {
-        "option": "prime",
-        "type": "bool",
-        "default": False,
-        "condition": True,
-        "label": _("Enable NVIDIA Prime Render Offload"),
-        "help": _("If you have the latest NVIDIA driver and the properly patched xorg-server (see "
-                  "https://download.nvidia.com/XFree86/Linux-x86_64/435.17/README/primerenderoffload.html"
-                  "), you can launch a game on your NVIDIA GPU by toggling this switch. This will apply "
-                  "__NV_PRIME_RENDER_OFFLOAD=1 and "
-                  "__GLX_VENDOR_LIBRARY_NAME=nvidia environment variables.")
-    },
-    {
-        "option": "dri_prime",
-        "type": "bool",
-        "default": USE_DRI_PRIME,
-        "condition": USE_DRI_PRIME,
-        "label": _("Use discrete graphics"),
-        "advanced": True,
-        "help": _("If you have open source graphic drivers (Mesa), selecting this "
-                  "option will run the game with the 'DRI_PRIME=1' environment variable, "
-                  "activating your discrete graphic chip for high 3D "
-                  "performance."),
-    },
-    {
-        "option": "sdl_video_fullscreen",
-        "type": "choice",
-        "label": _("SDL 1.2 Fullscreen Monitor"),
-        "choices": get_output_list,
-        "default": "off",
-        "advanced": True,
-        "help": _("Hint SDL 1.2 games to use a specific monitor when going "
-                  "fullscreen by setting the SDL_VIDEO_FULLSCREEN "
-                  "environment variable"),
-    },
-    {
-        "option": "display",
-        "type": "choice",
-        "label": _("Turn off monitors except"),
-        "choices": get_output_choices,
-        "condition": linux.LINUX_SYSTEM.display_server != "wayland",
-        "default": "off",
-        "advanced": True,
-        "help": _("Only keep the selected screen active while the game is "
-                  "running. \n"
-                  "This is useful if you have a dual-screen setup, and are \n"
-                  "having display issues when running a game in fullscreen."),
-    },
-    {
-        "option": "resolution",
-        "type": "choice",
-        "label": _("Switch resolution to"),
-        "choices": get_resolution_choices,
-        "condition": linux.LINUX_SYSTEM.display_server != "wayland",
-        "default": "off",
-        "help": _("Switch to this screen resolution while the game is running."),
-    },
-    {
+        "section": "Text based games",
         "option": "terminal",
         "label": _("CLI mode"),
         "type": "bool",
@@ -445,6 +593,7 @@ system_options = [  # pylint: disable=invalid-name
                   "Only useful for ASCII based games. May cause issues with graphical games."),
     },
     {
+        "section": "Text based games",
         "option": "terminal_app",
         "label": _("Text based games emulator"),
         "type": "choice_with_entry",
@@ -456,6 +605,14 @@ system_options = [  # pylint: disable=invalid-name
                   "the terminal's command or path."),
     },
     {
+        "section": "Game execution",
+        "option": "env",
+        "type": "mapping",
+        "label": _("Environment variables"),
+        "help": _("Environment variables loaded at run time"),
+    },
+    {
+        "section": "Game execution",
         "option": "locale",
         "type": "choice",
         "label": _("Locale"),
@@ -467,19 +624,7 @@ system_options = [  # pylint: disable=invalid-name
         "help": _("Can be used to force certain locale for an app. Fixes encoding issues in legacy software."),
     },
     {
-        "option": "env",
-        "type": "mapping",
-        "label": _("Environment variables"),
-        "help": _("Environment variables loaded at run time"),
-    },
-    {
-        "option": "antimicro_config",
-        "type": "file",
-        "label": _("AntiMicroX Profile"),
-        "advanced": True,
-        "help": _("Path to an AntiMicroX profile file"),
-    },
-    {
+        "section": "Game execution",
         "option": "prefix_command",
         "type": "string",
         "label": _("Command prefix"),
@@ -488,6 +633,7 @@ system_options = [  # pylint: disable=invalid-name
                   "execution command."),
     },
     {
+        "section": "Game execution",
         "option": "manual_command",
         "type": "file",
         "label": _("Manual script"),
@@ -495,6 +641,7 @@ system_options = [  # pylint: disable=invalid-name
         "help": _("Script to execute from the game's contextual menu"),
     },
     {
+        "section": "Game execution",
         "option": "prelaunch_command",
         "type": "file",
         "label": _("Pre-launch script"),
@@ -502,6 +649,7 @@ system_options = [  # pylint: disable=invalid-name
         "help": _("Script to execute before the game starts"),
     },
     {
+        "section": "Game execution",
         "option": "prelaunch_wait",
         "type": "bool",
         "label": _("Wait for pre-launch script completion"),
@@ -510,6 +658,7 @@ system_options = [  # pylint: disable=invalid-name
         "help": _("Run the game only once the pre-launch script has exited"),
     },
     {
+        "section": "Game execution",
         "option": "postexit_command",
         "type": "file",
         "label": _("Post-exit script"),
@@ -517,6 +666,7 @@ system_options = [  # pylint: disable=invalid-name
         "help": _("Script to execute when the game exits"),
     },
     {
+        "section": "Game execution",
         "option": "include_processes",
         "type": "string",
         "label": _("Include processes"),
@@ -527,6 +677,7 @@ system_options = [  # pylint: disable=invalid-name
                   "can be wrapped in quotation marks."),
     },
     {
+        "section": "Game execution",
         "option": "exclude_processes",
         "type": "string",
         "label": _("Exclude processes"),
@@ -538,6 +689,7 @@ system_options = [  # pylint: disable=invalid-name
                   "can be wrapped in quotation marks."),
     },
     {
+        "section": "Game execution",
         "option": "killswitch",
         "type": "string",
         "label": _("Killswitch file"),
@@ -546,15 +698,9 @@ system_options = [  # pylint: disable=invalid-name
                   "(usually /dev/input/js0 to stop the game on joystick "
                   "unplugging)"),
     },
+
     {
-        "option": "sdl_gamecontrollerconfig",
-        "type": "string",
-        "label": _("SDL2 gamepad mapping"),
-        "advanced": True,
-        "help": _("SDL_GAMECONTROLLERCONFIG mapping string or path to a custom "
-                  "gamecontrollerdb.txt file containing mappings."),
-    },
-    {
+        "section": "Xephyr (Deprecated, use Gamescope)",
         "option": "xephyr",
         "label": _("Use Xephyr"),
         "type": "choice",
@@ -569,6 +715,7 @@ system_options = [  # pylint: disable=invalid-name
         "help": _("Run program in Xephyr to support 8BPP and 16BPP color modes"),
     },
     {
+        "section": "Xephyr (Deprecated, use Gamescope)",
         "option": "xephyr_resolution",
         "type": "string",
         "label": _("Xephyr resolution"),
@@ -576,6 +723,7 @@ system_options = [  # pylint: disable=invalid-name
         "help": _("Screen resolution of the Xephyr server"),
     },
     {
+        "section": "Xephyr (Deprecated, use Gamescope)",
         "option": "xephyr_fullscreen",
         "type": "bool",
         "label": _("Xephyr Fullscreen"),

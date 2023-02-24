@@ -12,7 +12,6 @@ from lutris.database import games as games_db
 from lutris.database.services import ServiceGameCollection
 from lutris.exceptions import watch_errors
 from lutris.game import Game
-from lutris.game_actions import GameActions
 from lutris.gui import dialogs
 from lutris.gui.addgameswindow import AddGamesWindow
 from lutris.gui.config.preferences_dialog import PreferencesDialog
@@ -22,7 +21,6 @@ from lutris.gui.views import COL_ID, COL_NAME
 from lutris.gui.views.grid import GameGridView
 from lutris.gui.views.list import GameListView
 from lutris.gui.views.store import GameStore
-from lutris.gui.widgets.contextual_menu import ContextualMenu
 from lutris.gui.widgets.game_bar import GameBar
 from lutris.gui.widgets.gi_composites import GtkTemplate
 from lutris.gui.widgets.sidebar import LutrisSidebar
@@ -82,7 +80,6 @@ class LutrisWindow(Gtk.ApplicationWindow,
         self.window_size = (width, height)
         self.maximized = settings.read_setting("maximized") == "True"
         self.service = None
-        self.game_actions = GameActions(application=application, window=self)
         self.search_timer_id = None
         self.selected_category = settings.read_setting("selected_category", default="runner:all")
         self.filters = self.load_filters()
@@ -133,8 +130,9 @@ class LutrisWindow(Gtk.ApplicationWindow,
         GObject.add_emission_hook(BaseService, "service-games-loaded", self.on_service_games_updated)
         GObject.add_emission_hook(Game, "game-updated", self.on_game_updated)
         GObject.add_emission_hook(Game, "game-stopped", self.on_game_stopped)
+        GObject.add_emission_hook(Game, "game-installed", self.on_game_installed)
         GObject.add_emission_hook(Game, "game-removed", self.on_game_removed)
-        GObject.add_emission_hook(Game, "game-unhandled_error", self.on_game_unhandled_error)
+        GObject.add_emission_hook(Game, "game-unhandled-error", self.on_game_unhandled_error)
 
     def _init_actions(self):
         Action = namedtuple("Action", ("callback", "type", "enabled", "default", "accel"))
@@ -205,7 +203,6 @@ class LutrisWindow(Gtk.ApplicationWindow,
         """Finish initializing the view"""
         self._bind_zoom_adjustment()
         self.current_view.grab_focus()
-        self.current_view.contextual_menu = ContextualMenu(self.game_actions.get_game_actions())
 
     def on_sidebar_realize(self, widget, data=None):
         """Grab the initial focus after the sidebar is initialized - so the view is ready."""
@@ -215,8 +212,7 @@ class LutrisWindow(Gtk.ApplicationWindow,
         """Handler for drop event"""
         file_paths = [unquote(urlparse(uri).path) for uri in data.get_uris()]
         dialog = ImportGameDialog(file_paths, parent=self)
-        dialog.run()
-        dialog.destroy()
+        dialog.show()
 
     def load_filters(self):
         """Load the initial filters when creating the view"""
@@ -427,7 +423,8 @@ class LutrisWindow(Gtk.ApplicationWindow,
         if game:
             if self.game_bar:
                 self.game_bar.destroy()
-            self.game_bar = GameBar(game, self.game_actions, self.application)
+
+            self.game_bar = GameBar(game, self.application, self)
             self.revealer_box.pack_start(self.game_bar, True, True, 0)
         elif self.game_bar:
             # The game bar can't be destroyed here because the game gets unselected on Wayland
@@ -483,7 +480,7 @@ class LutrisWindow(Gtk.ApplicationWindow,
         else:
             self.search_entry.set_placeholder_text(_("Search games"))
         for view in self.views.values():
-            view.service = self.service.id if self.service else None
+            view.service = self.service
         GLib.idle_add(self.update_revealer)
         for game in games:
             self.game_store.add_game(game)
@@ -628,7 +625,6 @@ class LutrisWindow(Gtk.ApplicationWindow,
 
             self.current_view.connect("game-selected", self.on_game_selection_changed)
             self.current_view.connect("game-activated", self.on_game_activated)
-            self.current_view.contextual_menu = ContextualMenu(self.game_actions.get_game_actions())
 
             scrolledwindow = Gtk.ScrolledWindow()
             scrolledwindow.add(self.current_view)
@@ -760,7 +756,6 @@ class LutrisWindow(Gtk.ApplicationWindow,
 
     def on_game_unhandled_error(self, game, error):
         """Called when a game has sent the 'game-error' signal"""
-        logger.exception("%s has encountered an error: %s", game, error, exc_info=error)
         dialogs.ErrorDialog(str(error), parent=self)
         return True
 
@@ -885,6 +880,9 @@ class LutrisWindow(Gtk.ApplicationWindow,
         # but on the running page this is okay.
         if selected_row is not None and selected_row.id == "running":
             self.game_store.remove_game(game.id)
+        return True
+
+    def on_game_installed(self, game):
         return True
 
     def on_game_removed(self, game):
